@@ -1,0 +1,54 @@
+id: 09_local_taxi_scheduled
+namespace: zoomcamp
+
+inputs:
+  - id: taxis
+    type: ARRAY
+    itemType: STRING
+    defaults: [ "green", "yellow" ]
+  - id: start_month
+    type: STRING
+    defaults: "2019-01"
+  - id: end_month
+    type: STRING
+    defaults: "2019-03"
+
+tasks:
+  - id: generate_month_range
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    beforeCommands: [ pip install python-dateutil ]
+    env:
+      START_MONTH: "{{ inputs.start_month }}"
+      END_MONTH: "{{ inputs.end_month }}"
+    script: |
+      import os, json
+      from datetime import datetime
+      from dateutil.relativedelta import relativedelta
+      start = datetime.strptime(os.environ['START_MONTH'], "%Y-%m")
+      end = datetime.strptime(os.environ['END_MONTH'], "%Y-%m")
+      months, current = [], start
+      while current <= end:
+          months.append(current.strftime("%Y-%m"))
+          current += relativedelta(months=1)
+      print("::" + json.dumps({'outputs': {'months': months}}) + "::")
+
+  - id: loop_taxis
+    type: io.kestra.plugin.core.flow.ForEach
+    values: "{{ inputs.taxis }}"
+    tasks:
+      - id: loop_months
+        type: io.kestra.plugin.core.flow.ForEach
+        values: "{{ outputs.generate_month_range.vars.months }}"
+        # Sequential execution is required because of the shared staging table
+        concurrencyLimit: 1 
+        tasks:
+          - id: call_worker
+            type: io.kestra.plugin.core.flow.Subflow
+            flowId: 09_taxi_worker
+            namespace: zoomcamp
+            inputs:
+              taxi: "{{ parent.taskrun.value }}"
+              month: "{{ taskrun.value }}"
+            wait: true # Wait for the month to finish before starting next
+            transmitFailed: true

@@ -1,0 +1,224 @@
+id: 09_taxi_worker
+namespace: zoomcamp
+
+inputs:
+  - id: taxi
+    type: STRING
+  - id: month
+    type: STRING
+
+tasks:
+  # 1. Download CSV
+  - id: extract
+    type: io.kestra.plugin.scripts.shell.Commands
+    outputFiles: [ "data.csv" ]
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    commands:
+      - wget -qO- https://github.com/DataTalksClub/nyc-tlc-data/releases/download/{{ inputs.taxi }}/{{ inputs.taxi }}_tripdata_{{ inputs.month }}.csv.gz | gunzip > data.csv
+  
+
+  - id: prepare_staging_table
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: jdbc:postgresql://pgdatabase:5432/ny_taxi
+    username: root
+    password: root
+    sql: |
+      DROP TABLE IF EXISTS staging_taxi_data;
+      {% if inputs.taxi == 'yellow' %}
+      CREATE TABLE staging_taxi_data (
+          vendorid TEXT, tpep_pickup_datetime TEXT, tpep_dropoff_datetime TEXT,
+          passenger_count TEXT, trip_distance TEXT, ratecodeid TEXT,
+          store_and_fwd_flag TEXT, pulocationid TEXT, dolocationid TEXT,
+          payment_type TEXT, fare_amount TEXT, extra TEXT, mta_tax TEXT,
+          tip_amount TEXT, tolls_amount TEXT, improvement_surcharge TEXT,
+          total_amount TEXT, congestion_surcharge TEXT
+      );
+      {% else %}
+      CREATE TABLE staging_taxi_data (
+          vendorid TEXT, lpep_pickup_datetime TEXT, lpep_dropoff_datetime TEXT,
+          store_and_fwd_flag TEXT, ratecodeid TEXT, pulocationid TEXT,
+          dolocationid TEXT, passenger_count TEXT, trip_distance TEXT,
+          fare_amount TEXT, extra TEXT, mta_tax TEXT, tip_amount TEXT,
+          tolls_amount TEXT, ehail_fee TEXT, improvement_surcharge TEXT,
+          total_amount TEXT, payment_type TEXT, trip_type TEXT,
+          congestion_surcharge TEXT
+      );
+      {% endif %}
+
+  # 3. Load CSV into staging
+  - id: load_to_staging
+    type: io.kestra.plugin.jdbc.postgresql.CopyIn
+    url: jdbc:postgresql://pgdatabase:5432/ny_taxi
+    username: root
+    password: root
+    table: "staging_taxi_data"
+    from: "{{ outputs.extract.outputFiles['data.csv'] }}"
+    format: CSV
+    header: true
+    delimiter: ","
+
+  # 4. Create final table
+  - id: create_final_table
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://pgdatabase:5432/ny_taxi
+    username: root
+    password: root
+    sql: |
+      {% if inputs.taxi == 'yellow' %}
+      CREATE TABLE IF NOT EXISTS yellow_tripdata (
+        unique_row_id TEXT PRIMARY KEY,
+        filename TEXT,
+        vendor_id TEXT,
+        pickup_datetime TIMESTAMP,
+        dropoff_datetime TIMESTAMP,
+        passenger_count INT,
+        trip_distance NUMERIC,
+        rate_code_id TEXT,
+        store_and_fwd_flag TEXT,
+        pu_location_id TEXT,
+        do_location_id TEXT,
+        payment_type INT,
+        fare_amount NUMERIC,
+        extra NUMERIC,
+        mta_tax NUMERIC,
+        tip_amount NUMERIC,
+        tolls_amount NUMERIC,
+        improvement_surcharge NUMERIC,
+        total_amount NUMERIC,
+        congestion_surcharge NUMERIC
+      )
+      {% else %}
+      CREATE TABLE IF NOT EXISTS green_tripdata (
+        unique_row_id TEXT PRIMARY KEY,
+        filename TEXT,
+        vendor_id TEXT,
+        pickup_datetime TIMESTAMP,
+        dropoff_datetime TIMESTAMP,
+        store_and_fwd_flag TEXT,
+        rate_code_id TEXT,
+        pu_location_id TEXT,
+        do_location_id TEXT,
+        passenger_count INT,
+        trip_distance NUMERIC,
+        fare_amount NUMERIC,
+        extra NUMERIC,
+        mta_tax NUMERIC,
+        tip_amount NUMERIC,
+        tolls_amount NUMERIC,
+        ehail_fee NUMERIC,
+        improvement_surcharge NUMERIC,
+        total_amount NUMERIC,
+        payment_type INT,
+        trip_type TEXT,
+        congestion_surcharge NUMERIC
+      )
+      {% endif %}
+
+  # 5. Ensure all needed columns exist (idempotent)
+  - id: add_missing_columns
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: jdbc:postgresql://pgdatabase:5432/ny_taxi
+    username: root
+    password: root
+    sql: |
+      {% if inputs.taxi == 'green' %}
+      ALTER TABLE green_tripdata
+        ADD COLUMN IF NOT EXISTS ehail_fee NUMERIC,
+        ADD COLUMN IF NOT EXISTS trip_type TEXT;
+      {% endif %}
+      ALTER TABLE {{ inputs.taxi }}_tripdata
+        ADD COLUMN IF NOT EXISTS unique_row_id TEXT PRIMARY KEY;
+
+  # 6. Normalize and upsert into final table
+  - id: normalize_and_upsert
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://pgdatabase:5432/ny_taxi
+    username: root
+    password: root
+    sql: |
+      {% if inputs.taxi == 'yellow' %}
+      INSERT INTO yellow_tripdata (
+        unique_row_id, filename, vendor_id, pickup_datetime, dropoff_datetime,
+        passenger_count, trip_distance, rate_code_id, store_and_fwd_flag,
+        pu_location_id, do_location_id, payment_type, fare_amount, extra,
+        mta_tax, tip_amount, tolls_amount, improvement_surcharge, total_amount,
+        congestion_surcharge
+      )
+      SELECT
+        md5(
+          coalesce(vendorid,'') ||
+          coalesce(NULLIF(tpep_pickup_datetime,'N'),'') ||
+          coalesce(NULLIF(tpep_dropoff_datetime,'N'),'') ||
+          coalesce(pulocationid,'') ||
+          coalesce(dolocationid,'')
+        ),
+        '{{ inputs.taxi }}_tripdata_{{ inputs.month }}.csv',
+        vendorid,
+        NULLIF(tpep_pickup_datetime,'N')::timestamp,
+        NULLIF(tpep_dropoff_datetime,'N')::timestamp,
+        NULLIF(passenger_count,'')::int,
+        NULLIF(trip_distance,'')::numeric,
+        ratecodeid,
+        store_and_fwd_flag,
+        pulocationid,
+        dolocationid,
+        NULLIF(payment_type,'')::int,
+        NULLIF(fare_amount,'')::numeric,
+        NULLIF(extra,'')::numeric,
+        NULLIF(mta_tax,'')::numeric,
+        NULLIF(tip_amount,'')::numeric,
+        NULLIF(tolls_amount,'')::numeric,
+        NULLIF(improvement_surcharge,'')::numeric,
+        NULLIF(total_amount,'')::numeric,
+        NULLIF(congestion_surcharge,'')::numeric
+      FROM staging_taxi_data
+      ON CONFLICT (unique_row_id) DO NOTHING;
+      {% else %}
+      INSERT INTO green_tripdata (
+          unique_row_id, filename, vendor_id, pickup_datetime, dropoff_datetime,
+          store_and_fwd_flag, rate_code_id, pu_location_id, do_location_id,
+          passenger_count, trip_distance, fare_amount, extra, mta_tax, tip_amount,
+          tolls_amount, ehail_fee, improvement_surcharge, total_amount, payment_type,
+          trip_type, congestion_surcharge
+      )
+      SELECT
+          md5(
+            coalesce(vendorid,'') ||
+            coalesce(NULLIF(lpep_pickup_datetime,'N'),'') ||
+            coalesce(NULLIF(lpep_dropoff_datetime,'N'),'') ||
+            coalesce(pulocationid,'') ||
+            coalesce(dolocationid,'')
+          ),
+          '{{ inputs.taxi }}_tripdata_{{ inputs.month }}.csv',
+          vendorid,
+          NULLIF(lpep_pickup_datetime,'N')::timestamp,
+          NULLIF(lpep_dropoff_datetime,'N')::timestamp,
+          store_and_fwd_flag,
+          ratecodeid,
+          pulocationid,
+          dolocationid,
+          NULLIF(passenger_count,'')::int,
+          NULLIF(trip_distance,'')::numeric,
+          NULLIF(fare_amount,'')::numeric,
+          NULLIF(extra,'')::numeric,
+          NULLIF(mta_tax,'')::numeric,
+          NULLIF(tip_amount,'')::numeric,
+          NULLIF(tolls_amount,'')::numeric,
+          NULLIF(ehail_fee,'')::numeric,
+          NULLIF(improvement_surcharge,'')::numeric,
+          NULLIF(total_amount,'')::numeric,
+          NULLIF(payment_type,'')::int,
+          trip_type,
+          NULLIF(congestion_surcharge,'')::numeric
+      FROM staging_taxi_data
+      ON CONFLICT (unique_row_id) DO NOTHING;
+      {% endif %}
+
+  # 7. Clear staging
+  - id: truncate_staging_table
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://pgdatabase:5432/ny_taxi
+    username: root
+    password: root
+    sql: DROP TABLE staging_taxi_data;
